@@ -1,0 +1,293 @@
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: 'Kernel source repo URL'
+        required: true
+        default: 'https://github.com/LineageOS/android_kernel_samsung_sm7125'
+      kernel_branch:
+        description: 'Kernel source branch'
+        required: true
+        default: 'lineage-20'
+      defconfig:
+        description: 'Defconfig path (từ gốc kernel)'
+        required: true
+        default: 'arch/arm64/configs/a52q_eur_open_defconfig'
+      ksu_tag:
+        description: 'KernelSU tag'
+        required: true
+        default: 'v0.9.5'
+      susfs_branch:
+        description: 'susfs4ksu branch'
+        required: true
+        default: 'kernel-4.14'
+
+jobs:
+  build:
+    name: Build kernel
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout builder repo
+        uses: actions/checkout@v4
+        with:
+          path: builder
+
+      - name: Install build dependencies
+        run: |
+          sudo apt p-get update
+          sudo apt-get install -ngy \
+            bc bison build-essential ccache curl flexcr g++-multilib gcc-multilib \
+            git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev \
+            lib32z1-dev libelf-dev liblz4-tool libncurses5 libncurses5-dev \
+            libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzopush \
+            python2 python2-minimal python3 rsync schedtool squashfs-tools \
+            xsltproc zip zlib1g-dev patch cpio
+          sudo ln -sf /usr/bin/python2 /usr/bin/python 2>/dev/null || \
+            sudo ln -sf /usr/bin/python3 /usr/bin/python
+          echo "python -> $(readlink -f /usr/bin/python)"
+
+      - name: Clone kernel source
+        run: |
+          set -e
+          mkdir -p work
+          cd work
+          echo "Cloning ${{ github.event.inputs.kernel_repo }} @ ${{ github.event.inputs.kernel_branch }}"
+          git clone --depth=1 \
+            -b "${{ github.event.inputs.kernel_branch }}" \
+            "${{ github.event.inputs.kernel_repo }}" kernel
+          cd kernel
+          echo "=== Kiểm tra defconfig tồn tại ==="
+          ls -la "${{ github.event.inputs.defconfig }}" || {
+            echo "LỖI: Không tìm thấy ${{ github.event.inputs.defconfig }} trong source."
+            echo "Liệt kê các defconfig a52q có sẵn:"
+            find arch/arm64/configs -iname 'a52' -o -iname 'sm7125' -o -iname 'atoll' 2>/dev/null | head -50
+            exit 1
+          }
+
+      - name: Clone toolchains
+        run: |
+          set -e
+          cd work
+          mkdir -p toolchain && cd toolchain
+          git clone --depth=1 https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 gcc-arm64
+          git clone --depth=1 https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9 gcc-arm
+          git clone --depth=1 -b android-12.0.0_r3 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang
+          ls clang/ | head
+          ls gcc-arm64/bin/ | head -3
+
+      - name: Integrate KernelSU ${{ github.event.inputs.ksu_tag }}
+        run: |
+          set -e
+          cd work/kernel
+          git clone --depth=1 --branch "${{ github.event.inputs.ksu_tag }}" https://github.com/tiann/KernelSU.git KernelSU
+          find KernelSU -type f \( -name '.c' -o -name '.h' \) -print0 | xargs -0 sed -i 's/^#ifdef CONFIG_KPROBES$/#if defined(CONFIG_KPROBES) \&\& 0/'
+          grep -q 'source "KernelSU/kernel/Kconfig"' Kconfig || echo 'source "KernelSU/kernel/Kconfig"' >> Kconfig
+          grep -q 'KernelSU' Makefile || sed -i '0,/^obj-y/s//obj-$(CONFIG_KSU) += KernelSU\/\nobj-y/' Makefile
+          grep -n 'KernelSU' Kconfig Makefile | head
+
+      - name: Integrate SUSFS ${{ github.event.inputs.susfs_branch }}
+        run: |
+          set -e
+          cd work/kernel
+          git clone --depth=1 -b "${{ github.event.inputs.susfs_branch }}" https://github.com/simonpunk/susfs4ksu.git ../susfs4ksu
+          SUSFS=../susfs4ksu
+          KSU_PATCH=$(find $SUSFS -name '10_enable_susfs_for_ksu.patch' | head -1)
+          [ -n "$KSU_PATCH" ] || { echo "LỖI: không tìm thấy 10_enable_susfs_for_ksu.patch"; exit 1; }
+          cp "$KSU_PATCH" KernelSU/
+          cd KernelSU && patch -p1 < 10_enable_susfs_for_ksu.patch || echo "CẢNH BÁO: patch KernelSU không hoàn toàn"; cd ..
+          
+          for SRCDIR in "$SUSFS/kernel_patches/fs" "$SUSFS/kernel_patches" "$SUSFS/fs"; do
+            [ -d "$SRCDIR" ] && find "$SRCDIR" -maxdepth 1 -name 'susfs.c' -exec cp -v {} fs/ \;
+            [ -d "$SRCDIR" ] && find "$SRCDIR" -maxdepth 1 -name 'susfs.h' -exec cp -v {} fs/ \;
+          done
+          for SRCDIR in "$SUSFS/kernel_patches/include/linux" "$SUSFS/kernel_patches/include" "$SUSFS/include/linux"; do
+            [ -d "$SRCDIR" ] && find "$SRCDIR" -maxdepth 1 -name 'susfs*' -exec cp -v {} include/linux/ \;
+          done
+          
+          SUSFS_KERNEL_PATCH=$(find $SUSFS -name '50_add_susfs_in_kernel-4.14.patch' | head -1)
+          [ -n "$SUSFS_KERNEL_PATCH" ] || { echo "LỖI: không tìm thấy 50_add_susfs_in_kernel-4.14.patch"; exit 1; }
+          cp "$SUSFS_KERNEL_PATCH" .
+          patch -p1 --fuzz=3 < 50_add_susfs_in_kernel-4.14.patch || true
+          find . -name '*.rej' -print || true
+
+      - name: Apply manual KSU hooks
+        run: |
+          set -e
+          cd work/kernel
+          # Hook 1: fs/exec.c
+          if ! grep -q 'ksu_handle_execveat_sucompat' fs/exec.c; then
+            sed -i '/^static int do_execveat_common/i\
+#ifdef CONFIG_KSU\
+extern bool ksu_execveat_hook __read_mostly;\
+extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\
+extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\
+#endif' fs/exec.c
+            sed -i '/return __do_execve_file(fd, filename, argv, envp, flags, NULL);/i\
+#ifdef CONFIG_KSU\
+\tif (unlikely(ksu_execveat_hook))\
+\t\tksu_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);\
+\telse\
+\t\tksu_handle_execveat_sucompat(\&fd, \&filename, \&argv, \&envp, \&flags);\
+#endif' fs/exec.c
+          fi
+          # Hook 2: fs/open.c
+          if ! grep -q 'ksu_handle_faccessat' fs/open.c; then
+            sed -i '/^long do_faccessat/i\
+#ifdef CONFIG_KSU\
+extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\
+#endif' fs/open.c
+            sed -i '/unsigned int lookup_flags = LOOKUP_FOLLOW;/a\
+#ifdef CONFIG_KSU\
+\tksu_handle_faccessat(\&dfd, \&filename, \&mode, NULL);\
+#endif' fs/open.c
+          fi
+          # Hook 3: fs/read_write.c
+          if ! grep -q 'ksu_handle_vfs_read' fs/read_write.c; then
+            sed -i '/^ssize_t vfs_read/i\
+#ifdef CONFIG_KSU\
+extern bool ksu_vfs_read_hook __read_mostly;\
+extern int ksu_handleif_vfs_read(struct file **file_ptr, char __user **buf_ptr, size_t *count_ptr, loff_t **pos);\
+#endif' fs/read_write.c
+            sed -i '/^ssize_t ret;$/a\
+#ifdef CONFIG_KSU\
+\t (unlikely(ksu_vfs_read_hook))\
+\t\tksu_handle_vfs_read(\&file, \&buf, \&count, \&pos);\
+#endif' fs/read_write.c
+          fi
+          # Hook 4: fs/stat.c
+          if ! grep -q 'ksu_handle_stat' fs/stat.c; then
+            if grep -q '^int vfs_statx' fs/stat.c; then
+              sed -i '/^int vfs_statx/i\
+#ifdef CONFIG_KSU\
+extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\
+#endif' fs/stat.c
+              sed -i '/unsigned int lookup_flags = LOOKUP_FOLLOW | LOOKUP_AUTOMOUNT;/a\
+#ifdef CONFIG_KSU\
+\tksu_handle_stat(\&dfd, \&filename, \&flags);\
+#endif' fs/stat.c
+            fi
+          fi
+          # Hook 5: drivers/input/input.c
+          if ! grep -q 'ksu_handle_input_handle_event' drivers/input/input.c; then
+            sed -i '/^static void input_handle_event/i\
+#ifdef CONFIG_KSU\
+extern bool ksu_input_hook __read_mostly;\
+extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\
+#endif' drivers/input/input.c
+            sed -i '/int disposition = input_get_disposition(dev, type, code, \&value);/a\
+#ifdef CONFIG_KSU\
+\tif (unlikely(ksu_input_hook))\
+\t\tksu_handle_input_handle_event(\&type, \&code, \&value);\
+#endif' drivers/input/input.c
+          fi
+
+      - name: Update defconfig
+        run: |
+          set -e
+          cd work/kernel
+          DEFCONFIG="${{ github.event.inputs.defconfig }}"
+          cat >> "$DEFCONFIG" <<'CFGEOF'
+
+          CONFIG_KSU=y
+          # CONFIG_KPROBES is not set
+          # CONFIG_KPROBE_EVENTS is not set
+          # CONFIG_KSU_KPROBES_HOOK is not set
+          CONFIG_OVERLAY_FS=y
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SUS_MAPS=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          # CONFIG_KSU_SUSFS_SUS_SU is not set
+          # CONFIG_KSU_SUSFS_SUS_OVERLAYFS is not set
+          CFGEOF
+
+      - name: Build kernel
+        run: |
+          set -e
+          cd work/kernel
+          export ARCH=arm64 SUBARCH=arm64
+          TC=../toolchain
+          export PATH="$TC/clang/clang-r416183b/bin:$TC/gcc-arm64/bin:$TC/gcc-arm/bin:$PATH"
+          export CROSS_COMPILE="$TC/gcc-arm64/bin/aarch64-linux-android-"
+          export CROSS_COMPILE_ARM32="$TC/gcc-arm/bin/arm-linux-androideabi-"
+          export CC="$TC/clang/clang-r416183b/bin/clang"
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export LD="$TC/clang/clang-r416183b/bin/ld.lld"
+          export AR="$TC/clang/clang-r416183b/bin/llvm-ar"
+          export NM="$TC/clang/clang-r416183b/bin/llvm-nm"
+          export OBJCOPY="$TC/clang/clang-r416183b/bin/llvm-objcopy"
+          export OBJDUMP="$TC/clang/clang-r416183b/bin/llvm-objdump"
+          export READELF="$TC/clang/clang-r416183b/bin/llvm-readelf"
+          export STRIP="$TC/clang/clang-r416183b/bin/llvm-strip"
+
+          make O=out ARCH=arm64 CC="$CC" CLANG_TRIPLE="$CLANG_TRIPLE" CROSS_COMPILE="$CROSS_COMPILE" CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" "${{ github.event.inputs.defconfig }}"
+          make -j$(nproc) O=out ARCH=arm64 CC="$CC" CLANG_TRIPLE="$CLANG_TRIPLE" CROSS_COMPILE="$CROSS_COMPILE" CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" 2>&1 | tee build.log
+
+      - name: Check build result
+        if: always()
+        run: |
+          cd work/kernel
+          tail -30 build.log || true
+          if [ -f out/arch/arm64/boot/Image ] || [ -f out/arch/arm64/boot/Image.gz ]; then
+            echo "✅ BUILD THÀNH CÔNG"
+          else
+            echo "❌ BUILD THẤT BẠI"
+            exit 1
+          fi
+
+      - name: Package AnyKernel3
+        if: success()
+        run: |
+          cd work
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git
+          cd AnyKernel3
+          rm -rf .git README.md
+          cat > anykernel.sh <<'AKEOF'
+          properties() { '
+          kernel.string=A52q KernelSU+SUSFS
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          device.name1=a52q
+          device.name2=SM-A525F
+          device.name3=SM-A525M
+          device.name4=a52qxx
+          '; }
+          block=/dev/block/by-name/boot;
+          is_slot_device=0;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+          AKEOF
+          cd ../kernel
+          cp out/arch/arm64/boot/Image.gz ../AnyKernel3/ 2>/dev/null || cp out/arch/arm64/boot/Image ../AnyKernel3/
+          cd ../AnyKernel3
+          zip -r9 "../A52q-KernelSU-SUSFS.zip" . -x '.git'
+
+      - name: Upload kernel zip
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A52q-KernelSU-SUSFS
+          path: work/A52q-KernelSU-SUSFS.zip
+          retention-days: 30
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: work/kernel/build.log
+          retention-days: 14
